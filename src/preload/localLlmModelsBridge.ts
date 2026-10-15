@@ -27,6 +27,8 @@ import type { IpcRendererLike } from "./ipcTransport.js";
 // non-object junk and keeps the shared result types.
 const objectSchema = z.record(z.string(), z.unknown());
 
+const arraySchema = z.array(objectSchema);
+
 function passthroughResult<T extends object>(raw: unknown, channel: string): T {
   if (objectSchema.safeParse(raw).success) {
     // SAFETY: the record parse above rejected non-object transport junk, and
@@ -38,12 +40,32 @@ function passthroughResult<T extends object>(raw: unknown, channel: string): T {
   throw new Error(`Unexpected response shape from ${channel}`);
 }
 
+function passthroughArrayResult<T extends object>(raw: unknown, channel: string): T[] {
+  if (arraySchema.safeParse(raw).success) {
+    // SAFETY: array-of-record rejects non-array transport junk; main handlers
+    // are strict-typed against the same contract row shapes.
+    return raw as T[];
+  }
+
+  throw new Error(`Unexpected response shape from ${channel}`);
+}
+
 function passthroughInvoke<T extends object>(
   ipcRenderer: IpcRendererLike,
   channel: string,
   ...args: unknown[]
 ): Promise<T> {
   return ipcRenderer.invoke(channel, ...args).then((raw) => passthroughResult<T>(raw, channel));
+}
+
+function passthroughInvokeArray<T extends object>(
+  ipcRenderer: IpcRendererLike,
+  channel: string,
+  ...args: unknown[]
+): Promise<T[]> {
+  return ipcRenderer
+    .invoke(channel, ...args)
+    .then((raw) => passthroughArrayResult<T>(raw, channel));
 }
 
 function subscribeProgress(
@@ -69,9 +91,12 @@ export function createLocalLlmModelsBridge(ipcRenderer: IpcRendererLike): LocalL
   const c = localLlmChannels;
 
   return {
-    modelGetAll: () => passthroughInvoke<LocalLlmModelStatus[]>(ipcRenderer, c.modelGetAll),
+    modelGetAll: () => passthroughInvokeArray<LocalLlmModelStatus>(ipcRenderer, c.modelGetAll),
     modelGetActiveDownloads: () =>
-      passthroughInvoke<LocalModelDownloadStatusRow[]>(ipcRenderer, c.modelGetActiveDownloads),
+      passthroughInvokeArray<LocalModelDownloadStatusRow>(
+        ipcRenderer,
+        c.modelGetActiveDownloads
+      ),
     // SAFETY: the handler parses the id with the shared model-name schema and
     // answers a plain boolean; the cast re-voices the checked wire shape.
     modelCheck: (modelId: string) => ipcRenderer.invoke(c.modelCheck, modelId) as Promise<boolean>,

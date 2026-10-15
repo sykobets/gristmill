@@ -68,6 +68,7 @@
       "test/helpers/gemmaMtpDrafter.test.ts",
       "test/helpers/llamaServerContext.test.ts",
       "test/helpers/localLlmModelIpc.test.ts",
+      "test/helpers/localLlmModelsBridge.test.ts",
       "test/helpers/localModelLifecycleIpc.test.ts",
       "test/helpers/localReasoningBridgeChain.test.ts",
       "test/helpers/modelDirUtils.test.ts",
