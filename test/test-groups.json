@@ -496,6 +496,7 @@
     "files": [
       "test/helpers/diarizationPolicy.test.ts",
       "test/helpers/diarizationSpeakerMerge.test.ts",
+      "test/helpers/wavFormat.test.ts",
       "test/helpers/ffmpegUtils.test.ts",
       "test/helpers/meetingDiarizationInput.test.ts",
       "test/helpers/meetingTranscriptionLifecycle.test.ts",

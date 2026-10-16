@@ -16,6 +16,7 @@ import {
 import { resolveBinaryPath, gracefulStopProcess } from "../utils/serverUtils.js";
 import { getModelsDirForService } from "./modelDirUtils.js";
 import { convertToWav } from "./ffmpegUtils.js";
+import { DIARIZATION_SAMPLE_RATE, needsDiarizationResample, readWavFormat } from "./wavFormat.js";
 import { getSafeTempDir } from "./safeTempDir.js";
 import { applyConfirmedSpeaker, type SpeakerSegment } from "./speakerAssignmentPolicy.js";
 import * as sidecarPidFile from "./sidecarPidFile.js";
@@ -403,6 +404,22 @@ export class DiarizationManager {
       return [];
     }
 
+    // Meeting mixes are 24 kHz; resample anything that is not 16 kHz mono.
+    let inputPath = wavPath;
+    let tempInput: string | null = null;
+
+    if (needsDiarizationResample(readWavFormat(wavPath))) {
+      const runId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      tempInput = path.join(getSafeTempDir(), `ow-diarize-${runId}-16k.wav`);
+      await convertToWav(wavPath, tempInput, {
+        sampleRate: DIARIZATION_SAMPLE_RATE,
+        channels: 1,
+        signal: signal ?? undefined,
+      });
+      inputPath = tempInput;
+      debugLogger.info("Resampled diarization input to 16 kHz mono", { wavPath, inputPath });
+    }
+
     const segPath = this._resolveModelPath(SEGMENTATION_ONNX);
     const embPath = this._resolveModelPath(EMBEDDING_ONNX);
 
@@ -413,7 +430,7 @@ export class DiarizationManager {
       `--clustering.cluster-threshold=${threshold}`,
       "--min-duration-on=0.2",
       "--min-duration-off=0.5",
-      wavPath,
+      inputPath,
     ];
 
     debugLogger.info("Starting diarization", {
@@ -429,89 +446,93 @@ export class DiarizationManager {
     try {
       timeoutMs = Math.max(
         DIARIZATION_TIMEOUT_MS,
-        computeTranscriptionTimeoutMs(fs.statSync(wavPath).size / PCM16_MONO_16K_BYTES_PER_SECOND)
+        computeTranscriptionTimeoutMs(fs.statSync(inputPath).size / PCM16_MONO_16K_BYTES_PER_SECOND)
       );
     } catch {
       // Unreadable WAV: keep the flat cap.
     }
 
-    return new Promise<DiarizationSegment[]>((resolve) => {
-      let stdout = "";
-      let stderr = "";
+    try {
+      return await new Promise<DiarizationSegment[]>((resolve) => {
+        let stdout = "";
+        let stderr = "";
 
-      const proc = spawn(binaryPath, args, {
-        stdio: ["ignore", "pipe", "pipe"],
-        windowsHide: true,
-        detached: process.platform !== "win32",
-      });
+        const proc = spawn(binaryPath, args, {
+          stdio: ["ignore", "pipe", "pipe"],
+          windowsHide: true,
+          detached: process.platform !== "win32",
+        });
 
-      this._processes.add(proc);
+        this._processes.add(proc);
 
-      if (proc.pid !== undefined) sidecarPidFile.write("diarization", proc.pid);
+        if (proc.pid !== undefined) sidecarPidFile.write("diarization", proc.pid);
 
-      // The single pid-file slot tracks whichever process is still alive; only
-      // the reaper consumes it, and the Set is the real shutdown source.
-      const untrack = () => {
-        this._processes.delete(proc);
-        const survivor = this._processes.values().next().value;
+        // The single pid-file slot tracks whichever process is still alive; only
+        // the reaper consumes it, and the Set is the real shutdown source.
+        const untrack = () => {
+          this._processes.delete(proc);
+          const survivor = this._processes.values().next().value;
 
-        if (survivor && survivor.pid !== undefined)
-          sidecarPidFile.write("diarization", survivor.pid);
-        else sidecarPidFile.clear("diarization");
-      };
+          if (survivor && survivor.pid !== undefined)
+            sidecarPidFile.write("diarization", survivor.pid);
+          else sidecarPidFile.clear("diarization");
+        };
 
-      const timeout = setTimeout(() => {
-        debugLogger.warn("Diarization timed out", { timeoutMs });
-        gracefulStopProcess(proc).catch(() => {});
-        resolve([]);
-      }, timeoutMs);
-
-      // A cancelled upload kills the child immediately (same stop the timeout
-      // path uses); the close handler below still fires and cleans up.
-      const onAbort = () => {
-        debugLogger.info("Diarization cancelled, stopping process");
-        gracefulStopProcess(proc).catch(() => {});
-        resolve([]);
-      };
-
-      signal?.addEventListener("abort", onAbort, { once: true });
-
-      proc.stdout.on("data", (data: Buffer) => {
-        stdout += data.toString();
-      });
-
-      proc.stderr.on("data", (data: Buffer) => {
-        stderr += data.toString();
-      });
-
-      proc.on("close", (code: number | null) => {
-        clearTimeout(timeout);
-        signal?.removeEventListener("abort", onAbort);
-        untrack();
-
-        if (code !== 0) {
-          debugLogger.warn("Diarization process exited with error", {
-            code,
-            stderr: stderr.slice(-500).trim(),
-          });
+        const timeout = setTimeout(() => {
+          debugLogger.warn("Diarization timed out", { timeoutMs });
+          gracefulStopProcess(proc).catch(() => {});
           resolve([]);
+        }, timeoutMs);
 
-          return;
-        }
+        // A cancelled upload kills the child immediately (same stop the timeout
+        // path uses); the close handler below still fires and cleans up.
+        const onAbort = () => {
+          debugLogger.info("Diarization cancelled, stopping process");
+          gracefulStopProcess(proc).catch(() => {});
+          resolve([]);
+        };
 
-        const segments = this._parseOutput(stdout);
-        debugLogger.info("Diarization complete", { segmentCount: segments.length });
-        resolve(segments);
+        signal?.addEventListener("abort", onAbort, { once: true });
+
+        proc.stdout.on("data", (data: Buffer) => {
+          stdout += data.toString();
+        });
+
+        proc.stderr.on("data", (data: Buffer) => {
+          stderr += data.toString();
+        });
+
+        proc.on("close", (code: number | null) => {
+          clearTimeout(timeout);
+          signal?.removeEventListener("abort", onAbort);
+          untrack();
+
+          if (code !== 0) {
+            debugLogger.warn("Diarization process exited with error", {
+              code,
+              stderr: stderr.slice(-500).trim(),
+            });
+            resolve([]);
+
+            return;
+          }
+
+          const segments = this._parseOutput(stdout);
+          debugLogger.info("Diarization complete", { segmentCount: segments.length });
+          resolve(segments);
+        });
+
+        proc.on("error", (err: Error) => {
+          clearTimeout(timeout);
+          signal?.removeEventListener("abort", onAbort);
+          untrack();
+          debugLogger.warn("Diarization process error", { error: err.message });
+          resolve([]);
+        });
       });
-
-      proc.on("error", (err: Error) => {
-        clearTimeout(timeout);
-        signal?.removeEventListener("abort", onAbort);
-        untrack();
-        debugLogger.warn("Diarization process error", { error: err.message });
-        resolve([]);
-      });
-    });
+    } finally {
+      if (tempInput) await fsPromises.unlink(tempInput).catch(() => {});
+    }
   }
 
   _parseOutput(stdout: string): DiarizationSegment[] {
